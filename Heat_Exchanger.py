@@ -227,19 +227,19 @@ if st.session_state.lmtd:
     
     # Calculation for Suggestion Only
     area_per_tube = math.pi * (t_od_mm / 1000) * t_len
+    # Use final_area_req from your previous step
     suggested_n = math.ceil(final_area_req / area_per_tube)
     
     # 2. Manual Tube Entry
     st.write(f"💡 *Suggestion to meet target area: **{suggested_n} tubes***")
-    n_tubes = g3.number_input("Actual Number of Tubes to Install", value=0, step=1)
+    n_tubes = g3.number_input("Actual Number of Tubes to Install", value=int(suggested_n), step=1)
     
     if n_tubes > 0:
         actual_area = n_tubes * area_per_tube
         st.metric("Actual Heat Transfer Area", f"{actual_area:.2f} m²")
         
-        # 3. Sufficiency & Acceptance Logic
+        # 3. Sufficiency Logic
         diff_pct = ((actual_area / final_area_req) - 1) * 100
-        
         if actual_area >= final_area_req:
             st.success(f"✅ Area is Sufficient ({diff_pct:.1f}% Excess)")
         else:
@@ -249,25 +249,46 @@ if st.session_state.lmtd:
             if is_acceptable:
                 st.info("User accepted shortfall. Proceeding with current geometry.")
 
-        # 4. U-Value Back-Calculation (The "Check")
-        # Actual U needed = Q / (Actual Area * LMTD)
+        # 4. Physical Shell & Baffle Entry
+        st.markdown("### 🛠️ Shell & Baffle Selection")
+        
+        # Calculate theoretical min for guidance
+        pitch_ratio = 1.25
+        min_shell_id = 0.637 * math.sqrt(n_tubes * (pitch_ratio**2) * ((t_od_mm/1000)**2)) * 1000
+        
+        c1, c2 = st.columns(2)
+        # USER INPUT: Actual Shell Diameter
+        actual_shell_dia = c1.number_input(
+            "Actual Shell ID (mm)", 
+            value=int(min_shell_id), 
+            help=f"Theoretical minimum is ~{int(min_shell_id)} mm. Enter standard pipe size."
+        )
+        
+        # USER INPUT: Baffle Spacing
+        actual_baffle_space = c2.number_input(
+            "Baffle Spacing (mm)", 
+            value=int(actual_shell_dia * 0.4), 
+            help="Adjust this to balance Pressure Drop vs Heat Transfer."
+        )
+
+        # 5. U-Value Back-Calculation
         u_required_for_this_area = (duty_kw * 1000) / (actual_area * st.session_state.lmtd)
         
         st.markdown(f"### 🔍 Design Validation")
-        st.write(f"To make this exchanger work, the **Actual U-Value** must be at least **{u_required_for_this_area:.1f} W/m²·K**.")
+        st.write(f"To make this work, **Actual U** must be: **{u_required_for_this_area:.1f} W/m²·K**.")
         
         if u_required_for_this_area > u_design:
-            st.write(f"🚩 **Note:** This is **{((u_required_for_this_area/u_design)-1)*100:.1f}% higher** than your assumed U of {u_design}. You may need more tubes or a higher velocity.")
+            st.warning(f"🚩 Required U is higher than assumed {u_design}. Check velocities!")
         else:
-            st.write(f"✅ Your assumed U of {u_design} is conservative. This design is safe.")
+            st.success(f"✅ Design is safe (Conservative compared to assumed U).")
 
-        # 5. Shell Diameter
-        pitch_ratio = 1.25
-        shell_dia = 0.637 * math.sqrt(n_tubes * (pitch_ratio**2) * ((t_od_mm/1000)**2)) * 1000
-        st.info(f"Estimated Minimum Shell ID: **{int(shell_dia)} mm**")
+        # Store in session state for the Pressure Drop calculation step
+        st.session_state.shell_dia = actual_shell_dia
+        st.session_state.baffle_space = actual_baffle_space
 
 else:
     st.warning("Complete LMTD and Area steps first.")
+
 # --- STEP 7: DESIGN FOULING VALIDATION ---
 st.divider()
 st.subheader("Step 7: Design Fouling & Surface Margin")
@@ -321,7 +342,6 @@ else:
 st.divider()
 st.subheader("Step 8: Pressure Drop (ΔP) & Physical Properties")
 
-# Standard Physical Properties (at approx 40-60°C)
 PROPS_DB = {
     "Water": {"rho": 990, "mu": 0.0006},
     "Methanol": {"rho": 790, "mu": 0.00045},
@@ -334,80 +354,73 @@ PROPS_DB = {
     "Custom": {"rho": 1000, "mu": 0.001}
 }
 
-# Only run if Step 5 is complete
-if 'tube_side_fluid' in locals() and n_tubes > 0:
-    
-    # 1. IDENTIFY FLUIDS ON EACH SIDE
-    # Based on the radio button in Step 5
+# Ensure variables from Step 5 are accessible
+if 'n_tubes' in locals() and n_tubes > 0:
+    # 1. FLUID ALLOCATION MAPPING
     if tube_side_fluid == "Process Fluid":
-        t_fluid_name = p_fluid
-        s_fluid_name = u_type
+        t_fluid_name, s_fluid_name = p_fluid, u_type
+        m_t_kg_h = m_process
+        m_s_kg_h = m_util if 'm_util' in locals() else 0
     else:
-        t_fluid_name = u_type
-        s_fluid_name = p_fluid
-    
-    # 2. PULL DEFAULT PROPERTIES
+        t_fluid_name, s_fluid_name = u_type, p_fluid
+        m_t_kg_h = m_util if 'm_util' in locals() else 0
+        m_s_kg_h = m_process
+
+    # Look up default properties for the assigned fluids
     tp = PROPS_DB.get(t_fluid_name, PROPS_DB["Custom"])
     sp = PROPS_DB.get(s_fluid_name, PROPS_DB["Custom"])
 
-    st.info(f"📍 **Allocation:** {t_fluid_name} (Tube Side) | {s_fluid_name} (Shell Side)")
+    st.info(f"📍 **Allocation:** {t_fluid_name} (Tube) | {s_fluid_name} (Shell)")
 
     d1, d2 = st.columns(2)
-    
-    # TUBE SIDE INPUTS
-    d1.markdown(f"**Tube Side: {t_fluid_name}**")
-    rho_t = d1.number_input(f"Density of {t_fluid_name} (kg/m³)", value=float(tp["rho"]), key="rho_t_val")
-    mu_t = d1.number_input(f"Viscosity of {t_fluid_name} (Pa·s)", value=float(tp["mu"]), format="%.6f", key="mu_t_val")
-    
-    # SHELL SIDE INPUTS
-    d2.markdown(f"**Shell Side: {s_fluid_name}**")
-    rho_s = d2.number_input(f"Density of {s_fluid_name} (kg/m³)", value=float(sp["rho"]), key="rho_s_val")
-    mu_s = d2.number_input(f"Viscosity of {s_fluid_name} (Pa·s)", value=float(sp["mu"]), format="%.6f", key="mu_s_val")
+    rho_t = d1.number_input(f"Density {t_fluid_name}", value=float(tp["rho"]), key="rt_8")
+    mu_t = d1.number_input(f"Viscosity {t_fluid_name}", value=float(tp["mu"]), format="%.6f", key="mt_8")
+    rho_s = d2.number_input(f"Density {s_fluid_name}", value=float(sp["rho"]), key="rs_8")
+    mu_s = d2.number_input(f"Viscosity {s_fluid_name}", value=float(sp["mu"]), format="%.6f", key="ms_8")
 
-    # 3. VELOCITY CALCULATIONS (Auto-mapping mass flow)
-    # Get correct mass flow for each side
-    m_t = m_process if tube_side_fluid == "Process Fluid" else (m_steam if u_type == "Steam" else (m_util if 'm_util' in locals() else m_process))
-    m_s = m_process if tube_side_fluid == "Utility Stream" else (m_steam if u_type == "Steam" else (m_util if 'm_util' in locals() else m_process))
+    # 2. GEOMETRY CAPTURE
+    n_passes = d1.selectbox("Tube Passes (np)", [1, 2, 4, 6, 8], index=1)
+    t_id_m = (t_od_mm - 2.1) / 1000  # Wall thickness check
+    d_shell_m = actual_shell_dia / 1000
+    b_space_m = actual_baffle_space / 1000
 
-    # Re-calculate geometry locals
-    t_id_m = (t_od_mm - 3.2) / 1000 
-    n_passes_dp = 2 # Defaulting to 2, can be made a selectbox
-    b_space_m = (shell_dia * 0.5) / 1000 # Defaulting to 0.5 of shell dia
-    
-    # Velocities
-    v_tube = (m_t / 3600) / (rho_t * (n_tubes / n_passes_dp) * (math.pi / 4) * (t_id_m**2))
+    # 3. VELOCITY CALCULATIONS
+    area_per_pass = (n_tubes / n_passes) * (math.pi / 4) * (t_id_m**2)
+    v_tube = (m_t_kg_h / 3600) / (rho_t * area_per_pass) if (area_per_pass > 0 and rho_t > 0) else 0
     
     pitch_m = (t_od_mm * 1.25) / 1000
     clearance_m = pitch_m - (t_od_mm / 1000)
-    shell_area = (shell_dia / 1000) * b_space_m * (clearance_m / pitch_m)
-    v_shell = (m_s / 3600) / (rho_s * shell_area)
+    shell_area = d_shell_m * b_space_m * (clearance_m / pitch_m)
+    v_shell = (m_s_kg_h / 3600) / (rho_s * shell_area) if (shell_area > 0 and rho_s > 0) else 0
 
-    # 4. PRESSURE DROP CALCULATIONS
-    # Tube Side
-    re_t = (rho_t * v_tube * t_id_m) / mu_t
-    f_t = 0.316 * (re_t**-0.25) if re_t > 2300 else 64/re_t
-    dp_t = f_t * (t_len / t_id_m) * (rho_t * v_tube**2 / 2) * n_passes_dp / 100000 
+    # 4. GEOMETRY BREAKDOWN
+    st.markdown("### 📏 Intermediate Geometry & Velocity Breakdown")
+    g_col1, g_col2, g_col3 = st.columns(3)
+    g_col1.metric("Tube ID (d_i)", f"{t_id_m*1000:.2f} mm")
+    g_col2.metric("Area per Pass (A_p)", f"{area_per_pass:.5f} m²")
+    g_col3.metric("Tube Velocity (V_t)", f"{v_tube:.2f} m/s")
+    st.divider()
+
+    # 5. PRESSURE DROP (ΔP) CALCULATIONS
+    re_t = (rho_t * v_tube * t_id_m) / mu_t if mu_t > 0 else 0
+    f_t = 0.0014 + 0.125 * (re_t**-0.32) if re_t > 2100 else (64/re_t if re_t > 0 else 0)
+    dp_t = (f_t * (t_len / t_id_m) * (rho_t * (v_tube**2) / 2) * n_passes) / 100000 
     
-    # Shell Side (Kern Method)
-    de_m = (1.1 / (t_od_mm/1000)) * (pitch_m**2 - 0.917 * (t_od_mm/1000)**2)
-    re_s = (rho_s * v_shell * de_m) / mu_s
-    f_s = 0.316 * (re_s**-0.25)
-    n_cross = t_len / b_space_m
-    dp_s = f_s * (shell_dia/1000 / de_m) * (rho_s * v_shell**2 / 2) * n_cross / 100000
+    de_m = (4 * (pitch_m**2 * 0.866 / 2 - math.pi * (t_od_mm/1000)**2 / 8)) / (math.pi * (t_od_mm/1000) / 2)
+    re_s = (rho_s * v_shell * de_m) / mu_s if mu_s > 0 else 0
+    f_s = 0.5 * (re_s**-0.15) if re_s > 0 else 0
+    dp_s = (f_s * (d_shell_m / de_m) * (rho_s * (v_shell**2) / 2) * (t_len / b_space_m)) / 100000
 
-    # 5. RESULTS DISPLAY
-    res1, res2 = st.columns(2)
-    res1.metric(f"Tube ΔP ({t_fluid_name})", f"{dp_t:.3f} bar")
-    res1.caption(f"Velocity: {v_tube:.2f} m/s")
-    
-    res2.metric(f"Shell ΔP ({s_fluid_name})", f"{dp_s:.3f} bar")
-    res2.caption(f"Velocity: {v_shell:.2f} m/s")
-
-    if dp_t > 0.7 or dp_s > 0.7:
-        st.warning("⚠️ **High Pressure Drop!** Adjust Baffle Spacing or Tube Passes.")
+    # 6. RESULTS
+    r1, r2 = st.columns(2)
+    r1.metric(f"Tube ΔP ({t_fluid_name})", f"{dp_t:.4f} bar", help=f"Re: {int(re_t)}")
+    r2.metric(f"Shell ΔP ({s_fluid_name})", f"{dp_s:.4f} bar", help=f"Re: {int(re_s)}")
 
 else:
-    st.info("💡 Please complete Step 5 (Tube Count & Allocation) to view Pressure Drop.")
+    st.info("💡 Complete Step 5 (Tube Count & Allocation) to view Pressure Drop.")
+
+
+
 from fpdf import FPDF
 import datetime
 
@@ -439,7 +452,7 @@ if st.session_state.report_ready:
         # PROCESS DATA
         {"Sr. No": "1", "Section": "Process Data", "Parameters": "Fluid Allocation", "Value": f"{t_fluid_name} / {s_fluid_name}", "UOM": "Tube/Shell"},
         {"Sr. No": "2", "Section": "Process Data", "Parameters": "Total Heat duty", "Value": f"{duty_kw:.2f}", "UOM": "kW"},
-        {"Sr. No": "3", "Section": "Process Data", "Parameters": "Mass flow", "Value": f"{m_t:.1f} / {m_s:.1f}", "UOM": "kg/h"},
+        {"Sr. No": "3", "Section": "Process Data", "Parameters": "Mass flow", "Value": f"{m_t_kg_h:.1f} / {m_s_kg_h:.1f}", "UOM": "kg/h"},
         {"Sr. No": "4", "Section": "Process Data", "Parameters": "LMTD", "Value": f"{st.session_state.lmtd:.2f}", "UOM": "C"},
         
         # THERMAL DESIGN
@@ -452,7 +465,7 @@ if st.session_state.report_ready:
         {"Sr. No": "9", "Section": "Hardware", "Parameters": "Tube OD", "Value": f"{t_od_mm}", "UOM": "mm"},
         {"Sr. No": "10", "Section": "Hardware", "Parameters": "Tube Length", "Value": f"{t_len}", "UOM": "m"},
         {"Sr. No": "11", "Section": "Hardware", "Parameters": "Number of Tubes", "Value": f"{n_tubes}", "UOM": "Nos"},
-        {"Sr. No": "12", "Section": "Hardware", "Parameters": "Shell Diameter (ID)", "Value": f"{int(shell_dia)}", "UOM": "mm"},
+        {"Sr. No": "12", "Section": "Hardware", "Parameters": "Shell Diameter (ID)", "Value": f"{int(actual_shell_dia)}", "UOM": "mm"},
         
         # HYDRAULICS
         {"Sr. No": "13", "Section": "Hydraulics", "Parameters": "Tube Velocity", "Value": f"{v_tube:.2f}", "UOM": "m/s"},
