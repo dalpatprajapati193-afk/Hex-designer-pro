@@ -338,9 +338,9 @@ else:
 
 
 
-# --- STEP 8: PRESSURE DROP (ΔP) & PHYSICAL PROPERTIES ---
+# --- STEP 8: PRESSURE DROP (ΔP) & HYDRAULIC VALIDATION ---
 st.divider()
-st.subheader("Step 8: Pressure Drop (ΔP) & Physical Properties")
+st.subheader("Step 8: Pressure Drop (ΔP) & Hydraulic Validation")
 
 PROPS_DB = {
     "Water": {"rho": 990, "mu": 0.0006},
@@ -354,7 +354,7 @@ PROPS_DB = {
     "Custom": {"rho": 1000, "mu": 0.001}
 }
 
-# Ensure variables from Step 5 are accessible
+# Ensure variables from Step 5/7 are accessible
 if 'n_tubes' in locals() and n_tubes > 0:
     # 1. FLUID ALLOCATION MAPPING
     if tube_side_fluid == "Process Fluid":
@@ -366,58 +366,73 @@ if 'n_tubes' in locals() and n_tubes > 0:
         m_t_kg_h = m_util if 'm_util' in locals() else 0
         m_s_kg_h = m_process
 
-    # Look up default properties for the assigned fluids
     tp = PROPS_DB.get(t_fluid_name, PROPS_DB["Custom"])
     sp = PROPS_DB.get(s_fluid_name, PROPS_DB["Custom"])
 
-    st.info(f"📍 **Allocation:** {t_fluid_name} (Tube) | {s_fluid_name} (Shell)")
+    st.info(f"📍 **Allocation:** {t_fluid_name} (Tube Side) | {s_fluid_name} (Shell Side)")
 
-    d1, d2 = st.columns(2)
-    rho_t = d1.number_input(f"Density {t_fluid_name}", value=float(tp["rho"]), key="rt_8")
-    mu_t = d1.number_input(f"Viscosity {t_fluid_name}", value=float(tp["mu"]), format="%.6f", key="mt_8")
-    rho_s = d2.number_input(f"Density {s_fluid_name}", value=float(sp["rho"]), key="rs_8")
-    mu_s = d2.number_input(f"Viscosity {s_fluid_name}", value=float(sp["mu"]), format="%.6f", key="ms_8")
+    d_col1, d_col2 = st.columns(2)
+    rho_t = d_col1.number_input(f"Density {t_fluid_name} (kg/m³)", value=float(tp["rho"]), key="rt_final")
+    mu_t = d_col1.number_input(f"Viscosity {t_fluid_name} (Pa·s)", value=float(tp["mu"]), format="%.6f", key="mt_final")
+    
+    rho_s = d_col2.number_input(f"Density {s_fluid_name} (kg/m³)", value=float(sp["rho"]), key="rs_final")
+    mu_s = d_col2.number_input(f"Viscosity {s_fluid_name} (Pa·s)", value=float(sp["mu"]), format="%.6f", key="ms_final")
 
-    # 2. GEOMETRY CAPTURE
-    n_passes = d1.selectbox("Tube Passes (np)", [1, 2, 4, 6, 8], index=1)
-    t_id_m = (t_od_mm - 2.1) / 1000  # Wall thickness check
-    d_shell_m = actual_shell_dia / 1000
-    b_space_m = actual_baffle_space / 1000
-
-    # 3. VELOCITY CALCULATIONS
+    # 2. GEOMETRY & VELOCITY CALCULATIONS
+    n_passes = d_col1.selectbox("Select Tube Passes", [1, 2, 4, 6, 8], index=1)
+    t_id_m = (t_od_mm - 2.1) / 1000  # Internal Diameter
+    
+    # Tube Side
     area_per_pass = (n_tubes / n_passes) * (math.pi / 4) * (t_id_m**2)
     v_tube = (m_t_kg_h / 3600) / (rho_t * area_per_pass) if (area_per_pass > 0 and rho_t > 0) else 0
     
+    # Shell Side (Using your Actual Shell Dia and Baffle Spacing)
+    d_shell_m = actual_shell_dia / 1000
+    b_space_m = actual_baffle_space / 1000
     pitch_m = (t_od_mm * 1.25) / 1000
     clearance_m = pitch_m - (t_od_mm / 1000)
     shell_area = d_shell_m * b_space_m * (clearance_m / pitch_m)
     v_shell = (m_s_kg_h / 3600) / (rho_s * shell_area) if (shell_area > 0 and rho_s > 0) else 0
 
-    # 4. GEOMETRY BREAKDOWN
+    # 3. INTERMEDIATE BREAKDOWN DISPLAY
     st.markdown("### 📏 Intermediate Geometry & Velocity Breakdown")
     g_col1, g_col2, g_col3 = st.columns(3)
-    g_col1.metric("Tube ID (d_i)", f"{t_id_m*1000:.2f} mm")
-    g_col2.metric("Area per Pass (A_p)", f"{area_per_pass:.5f} m²")
-    g_col3.metric("Tube Velocity (V_t)", f"{v_tube:.2f} m/s")
-    st.divider()
+    g_col1.metric("Area per Pass (A_p)", f"{area_per_pass:.5f} m²")
+    g_col2.metric("Tube Velocity (V_t)", f"{v_tube:.2f} m/s")
+    g_col3.metric("Shell Velocity (V_s)", f"{v_shell:.2f} m/s")
 
-    # 5. PRESSURE DROP (ΔP) CALCULATIONS
+    # 4. DESIGN GUIDANCE (TEMA RANGES)
+    st.divider()
+    if v_tube < 0.9:
+        st.warning(f"💡 **Suggestion:** Velocity ({v_tube:.2f} m/s) is below 0.9 m/s. "
+                   "Consider **increasing Tube Passes** to prevent fouling.")
+    elif v_tube > 2.2:
+        st.error(f"⚠️ **High Velocity Alert:** {v_tube:.2f} m/s exceeds 2.2 m/s. "
+                 "Check if Pressure Drop is acceptable and watch for Erosion.")
+    else:
+        st.success(f"✅ **Optimal Velocity:** {v_tube:.2f} m/s is within the TEMA-recommended liquid range.")
+
+    # 5. PRESSURE DROP CALCULATIONS
+    # Tube Side
     re_t = (rho_t * v_tube * t_id_m) / mu_t if mu_t > 0 else 0
     f_t = 0.0014 + 0.125 * (re_t**-0.32) if re_t > 2100 else (64/re_t if re_t > 0 else 0)
     dp_t = (f_t * (t_len / t_id_m) * (rho_t * (v_tube**2) / 2) * n_passes) / 100000 
     
+    # Shell Side (Kern)
     de_m = (4 * (pitch_m**2 * 0.866 / 2 - math.pi * (t_od_mm/1000)**2 / 8)) / (math.pi * (t_od_mm/1000) / 2)
     re_s = (rho_s * v_shell * de_m) / mu_s if mu_s > 0 else 0
     f_s = 0.5 * (re_s**-0.15) if re_s > 0 else 0
     dp_s = (f_s * (d_shell_m / de_m) * (rho_s * (v_shell**2) / 2) * (t_len / b_space_m)) / 100000
 
-    # 6. RESULTS
-    r1, r2 = st.columns(2)
-    r1.metric(f"Tube ΔP ({t_fluid_name})", f"{dp_t:.4f} bar", help=f"Re: {int(re_t)}")
-    r2.metric(f"Shell ΔP ({s_fluid_name})", f"{dp_s:.4f} bar", help=f"Re: {int(re_s)}")
+    # 6. RESULTS SUMMARY
+    st.divider()
+    res1, res2 = st.columns(2)
+    res1.metric(f"Tube Side ΔP", f"{dp_t:.4f} bar", help=f"Fluid: {t_fluid_name} | Re: {int(re_t)}")
+    res2.metric(f"Shell Side ΔP", f"{dp_s:.4f} bar", help=f"Fluid: {s_fluid_name} | Re: {int(re_s)}")
 
 else:
-    st.info("💡 Complete Step 5 (Tube Count & Allocation) to view Pressure Drop.")
+    st.info("💡 Please complete Step 5 and Step 7 (Geometry) to view Hydraulic results.")
+
 
 
 
